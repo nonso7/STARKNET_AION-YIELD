@@ -1,8 +1,8 @@
 // ─── Contract Addresses (Starknet Sepolia Testnet) ────────────────────────────
-// Deployed: 2026-02-28 — contract/src/deployments/sepolia.json
+// Source of truth: contract/src/deployments/sepolia.json
 
 export const CONTRACTS = {
-  AION_VAULT:      "0x026678549ab6611b092d99527ead085713f3bd36ebdcbf1755dee4289d0fdcd7",
+  AION_VAULT:      "0x018b03d2e97e5721eea24b52cbb7a1485cbd57238baef7f49a920360767392ce",
   PRIVACY_LAYER:   "0x006ca61df5e017c18a98d5210e486784095537aef49f8e887584a96dd4af3730",
   STRATEGY_ROUTER: "0x05ac8afa902f2ae98c91419ed59c8bcca89983664ec66d0222ceb5d995d12168",
   VESU_ADAPTER:    "0x0551f4168c0fc88f9578726b718f0f941e4d1faa7010179215c1e161bfb70f34",

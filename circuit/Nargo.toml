@@ -1,0 +1,7 @@
+[package]
+name = "aion_zkp"
+type = "bin"
+authors = ["AION Yield"]
+compiler_version = ">=1.0.0"
+
+[dependencies]

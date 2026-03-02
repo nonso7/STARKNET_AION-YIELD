@@ -1,9 +1,12 @@
 "use client";
 
 import { useCallback, useState } from "react";
-import { useAccount, useContract, useSendTransaction, useReadContract } from "@starknet-react/core";
-import { CONTRACTS, AION_VAULT_ABI, ERC20_ABI, parseWBTC, formatWBTC } from "@/lib/contracts";
-import { generatePrivateNote, computeCommitment, storeNote, type PrivateNote } from "@/lib/privacy";
+import { useAccount, useReadContract } from "@starknet-react/core";
+import { CONTRACTS, AION_VAULT_ABI, ERC20_ABI, formatWBTC } from "@/lib/contracts";
+import {
+  generatePrivateNote, storeNote, getDenomination,
+  type PrivateNote, type DenominationTier,
+} from "@/lib/privacy";
 
 // ─── Public Deposit ────────────────────────────────────────────────────────────
 
@@ -11,19 +14,15 @@ export function usePublicDeposit() {
   const { account } = useAccount();
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const { sendAsync } = useSendTransaction({ calls: [] });
 
   const deposit = useCallback(
     async (btcAmount: string) => {
       if (!account) throw new Error("Wallet not connected");
       setIsLoading(true);
       setError(null);
-
       try {
-        const amount = parseWBTC(btcAmount);
-
-        // 1. Approve WBTC
-        // 2. Deposit into vault
+        // Convert WBTC decimal string to satoshis (8 decimals)
+        const amount = BigInt(Math.round(parseFloat(btcAmount) * 1e8));
         const calls = [
           {
             contractAddress: CONTRACTS.WBTC_TOKEN,
@@ -36,7 +35,6 @@ export function usePublicDeposit() {
             calldata: [amount.toString(), "0"],
           },
         ];
-
         const result = await account.execute(calls);
         return result;
       } catch (err: unknown) {
@@ -47,13 +45,20 @@ export function usePublicDeposit() {
         setIsLoading(false);
       }
     },
-    [account]
+    [account],
   );
 
   return { deposit, isLoading, error };
 }
 
-// ─── Private Deposit ───────────────────────────────────────────────────────────
+// ─── Private Deposit (ZK Edition) ──────────────────────────────────────────────
+//
+// Calldata sent on-chain:
+//   commitment      = Poseidon(secret, nullifier, tier)  — opaque hash
+//   denomination_tier = 0 | 1 | 2 | 3
+//
+// The WBTC amount is derived from the tier INSIDE the contract.
+// secret and nullifier never appear in calldata.
 
 export function usePrivateDeposit() {
   const { account } = useAccount();
@@ -62,19 +67,18 @@ export function usePrivateDeposit() {
   const [generatedNote, setGeneratedNote] = useState<PrivateNote | null>(null);
 
   const depositPrivate = useCallback(
-    async (btcAmount: string) => {
+    async (tier: DenominationTier) => {
       if (!account) throw new Error("Wallet not connected");
       setIsLoading(true);
       setError(null);
 
       try {
-        const amount = parseWBTC(btcAmount);
+        const denom = getDenomination(tier);
+        const amount = denom.satoshis;
 
-        // Generate private note off-chain
-        const note = generatePrivateNote(amount);
+        // Generate note off-chain — commitment includes the tier
+        const note = generatePrivateNote(tier);
         setGeneratedNote(note);
-
-        // Store note locally BEFORE sending tx (so it's safe if tx fails)
         storeNote(note);
 
         const calls = [
@@ -86,16 +90,16 @@ export function usePrivateDeposit() {
           {
             contractAddress: CONTRACTS.AION_VAULT,
             entrypoint: "deposit_private",
-            calldata: [note.commitment, amount.toString(), "0"],
+            // New interface: deposit_private(commitment: felt252, denomination_tier: u8)
+            // tier is 0/1/2/3 — fits in u8, amount is never in calldata
+            calldata: [note.commitment, tier.toString()],
           },
         ];
 
         const result = await account.execute(calls);
 
-        // Auto-update Merkle root after deposit confirms (server-side, uses deployer key)
-        fetch("/api/update-root", { method: "POST" }).catch(() => {
-          // Non-blocking — root update failure doesn't affect the deposit
-        });
+        // Trigger off-chain Merkle root update (non-blocking)
+        fetch("/api/update-root", { method: "POST" }).catch(() => {});
 
         return { result, note };
       } catch (err: unknown) {
@@ -106,7 +110,7 @@ export function usePrivateDeposit() {
         setIsLoading(false);
       }
     },
-    [account]
+    [account],
   );
 
   return { depositPrivate, isLoading, error, generatedNote };
@@ -124,7 +128,6 @@ export function usePublicWithdraw() {
       if (!account) throw new Error("Wallet not connected");
       setIsLoading(true);
       setError(null);
-
       try {
         const result = await account.execute([
           {
@@ -142,13 +145,22 @@ export function usePublicWithdraw() {
         setIsLoading(false);
       }
     },
-    [account]
+    [account],
   );
 
   return { withdraw, isLoading, error };
 }
 
-// ─── Private Withdraw ──────────────────────────────────────────────────────────
+// ─── Private Withdraw (ZK Edition) ─────────────────────────────────────────────
+//
+// Calldata sent on-chain:
+//   zk_proof         = Garaga-formatted proof bytes (opaque)
+//   nullifier_hash   = Poseidon(nullifier) — marks note as spent
+//   recipient        = withdrawal destination
+//   denomination_tier = 0 | 1 | 2 | 3
+//
+// secret and nullifier are NEVER in calldata — they exist only in the
+// ZK proof's private witness, computed off-chain by Barretenberg.
 
 export function usePrivateWithdraw() {
   const { account } = useAccount();
@@ -157,19 +169,18 @@ export function usePrivateWithdraw() {
 
   const withdrawPrivate = useCallback(
     async (
-      merkleProof: string[],
-      secret: string,
-      nullifier: string,
-      recipient: string,
-      amount: bigint
+      zkProof: string[],         // Garaga-formatted proof (felt252 array)
+      nullifierHash: string,     // Poseidon(nullifier)
+      recipient: string,         // Starknet address
+      tier: DenominationTier,
     ) => {
       if (!account) throw new Error("Wallet not connected");
       setIsLoading(true);
       setError(null);
 
       try {
-        // Encode Span<felt252> for merkle_proof
-        const proofCalldata = [merkleProof.length.toString(), ...merkleProof];
+        // Encode Span<felt252> for zk_proof
+        const proofCalldata = [zkProof.length.toString(), ...zkProof];
 
         const result = await account.execute([
           {
@@ -177,11 +188,9 @@ export function usePrivateWithdraw() {
             entrypoint: "withdraw_private",
             calldata: [
               ...proofCalldata,
-              secret,
-              nullifier,
+              nullifierHash,
               recipient,
-              amount.toString(),
-              "0",
+              tier.toString(),
             ],
           },
         ]);
@@ -194,7 +203,7 @@ export function usePrivateWithdraw() {
         setIsLoading(false);
       }
     },
-    [account]
+    [account],
   );
 
   return { withdrawPrivate, isLoading, error };
@@ -243,9 +252,9 @@ export function useVaultStats() {
     refetchInterval: 10000,
   });
 
-  const tvl = tvlRaw ? BigInt(tvlRaw.toString()) : 0;
+  const tvl = tvlRaw ? BigInt(tvlRaw.toString()) : 0n;
   const apyBps = apyRaw ? Number(apyRaw) : 0;
-  const shares = sharesRaw ? BigInt(sharesRaw.toString()) : 0;
+  const shares = sharesRaw ? BigInt(sharesRaw.toString()) : 0n;
   const wbtcBalance = wbtcBalanceRaw ? BigInt(wbtcBalanceRaw.toString()) : 0n;
 
   return {

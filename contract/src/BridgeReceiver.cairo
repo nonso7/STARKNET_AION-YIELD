@@ -179,7 +179,7 @@ pub mod BridgeReceiver {
                     vault.deposit(wbtc_amount);
                 } else {
                     // Private deposit — commitment was set at initiation
-                    vault.deposit_private(req.commitment, wbtc_amount);
+                    vault.deposit_private(req.commitment, 0_u8);
                 }
 
                 self.emit(AutoDepositExecuted {

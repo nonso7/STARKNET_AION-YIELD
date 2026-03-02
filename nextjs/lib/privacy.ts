@@ -1,90 +1,89 @@
-// ─── AION Yield — Privacy Helpers ─────────────────────────────────────────────
-// Client-side utilities for generating commitment schemes.
-// secret + nullifier are NEVER sent on-chain — only their Poseidon hash.
+// ─── AION Yield — Privacy Helpers (ZK Edition) ────────────────────────────────
+//
+// Denomination-based commitment scheme.
+//
+// WHY FIXED DENOMINATIONS?
+//   Without them the exact WBTC amount appears in calldata and any observer
+//   can fingerprint deposits by amount. With fixed tiers every deposit in a
+//   pool is identical in size — only the tier index (0-3) appears in calldata.
+//
+// COMMITMENT SCHEME:
+//   commitment = Poseidon(secret, nullifier, denomination_tier)
+//   The tier is baked in so a note cannot be redeemed for a different tier.
 
 import { hash } from "starknet";
 
+// ── Denomination tiers ─────────────────────────────────────────────────────
+
+export const DENOMINATIONS = [
+  { tier: 0, wbtc: "0.001", label: "0.001 WBTC", satoshis: 100_000n,     approxUsd: "~$50–100"   },
+  { tier: 1, wbtc: "0.01",  label: "0.01 WBTC",  satoshis: 1_000_000n,   approxUsd: "~$500–1K"   },
+  { tier: 2, wbtc: "0.1",   label: "0.1 WBTC",   satoshis: 10_000_000n,  approxUsd: "~$5K–10K"   },
+  { tier: 3, wbtc: "1.0",   label: "1.0 WBTC",   satoshis: 100_000_000n, approxUsd: "~$50K–100K" },
+] as const;
+
+export type DenominationTier = 0 | 1 | 2 | 3;
+
+export function getDenomination(tier: DenominationTier) {
+  return DENOMINATIONS[tier];
+}
+
+// ── Private note ────────────────────────────────────────────────────────────
+
 export interface PrivateNote {
-  secret: string;       // hex felt252
-  nullifier: string;    // hex felt252
-  commitment: string;   // poseidon(secret, nullifier)
-  amount: bigint;       // in satoshis
+  secret: string;
+  nullifier: string;
+  commitment: string;
+  nullifierHash: string;
+  denominationTier: DenominationTier;
   timestamp: number;
 }
 
-/**
- * Generate a random felt252 as a hex string.
- */
+// ── Random felt252 ──────────────────────────────────────────────────────────
+
 export function randomFelt(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(31));
   const hex = Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
   return "0x" + hex;
 }
 
-/**
- * Compute commitment = poseidon_hash_span([secret, nullifier]).
- * Must use computePoseidonHashOnElements (sponge construction) to match
- * Cairo's poseidon_hash_span — NOT computePoseidonHash which is different.
- */
-export function computeCommitment(secret: string, nullifier: string): string {
-  return hash.computePoseidonHashOnElements([secret, nullifier]);
+// ── Hash helpers ────────────────────────────────────────────────────────────
+
+export function computeCommitment(
+  secret: string,
+  nullifier: string,
+  tier: DenominationTier,
+): string {
+  return hash.computePoseidonHashOnElements([secret, nullifier, tier.toString()]);
 }
 
-/**
- * Compute nullifier hash = poseidon(nullifier).
- * This is what gets stored on-chain as spent.
- */
 export function computeNullifierHash(nullifier: string): string {
   return hash.computePoseidonHashOnElements([nullifier]);
 }
 
-/**
- * Generate a fresh private note for a deposit.
- * Store the returned note securely — losing it means losing access to funds.
- */
-export function generatePrivateNote(amount: bigint): PrivateNote {
+// ── Note generation ─────────────────────────────────────────────────────────
+
+export function generatePrivateNote(tier: DenominationTier): PrivateNote {
   const secret = randomFelt();
   const nullifier = randomFelt();
-  const commitment = computeCommitment(secret, nullifier);
-
-  return {
-    secret,
-    nullifier,
-    commitment,
-    amount,
-    timestamp: Date.now(),
-  };
+  const commitment = computeCommitment(secret, nullifier, tier);
+  const nullifierHash = computeNullifierHash(nullifier);
+  return { secret, nullifier, commitment, nullifierHash, denominationTier: tier, timestamp: Date.now() };
 }
 
-/**
- * Serialize a private note for local storage (encrypted in real app).
- */
+// ── Note storage (localStorage) ─────────────────────────────────────────────
+
 export function serializeNote(note: PrivateNote): string {
-  return JSON.stringify({
-    ...note,
-    amount: note.amount.toString(),
-  });
+  return JSON.stringify(note);
 }
 
-/**
- * Deserialize a private note from storage.
- */
 export function deserializeNote(raw: string): PrivateNote {
-  const parsed = JSON.parse(raw);
-  return {
-    ...parsed,
-    amount: BigInt(parsed.amount),
-  };
+  return JSON.parse(raw) as PrivateNote;
 }
 
-/**
- * Store a private note in localStorage under a key derived from commitment.
- * In production: encrypt with user's wallet key.
- */
 export function storeNote(note: PrivateNote): void {
   const key = `aion_note_${note.commitment.slice(2, 10)}`;
   localStorage.setItem(key, serializeNote(note));
-  // Also keep an index
   const indexRaw = localStorage.getItem("aion_note_index") ?? "[]";
   const index: string[] = JSON.parse(indexRaw);
   if (!index.includes(key)) {
@@ -93,9 +92,6 @@ export function storeNote(note: PrivateNote): void {
   }
 }
 
-/**
- * Load all stored private notes from localStorage.
- */
 export function loadAllNotes(): PrivateNote[] {
   const indexRaw = localStorage.getItem("aion_note_index") ?? "[]";
   const index: string[] = JSON.parse(indexRaw);
@@ -108,36 +104,22 @@ export function loadAllNotes(): PrivateNote[] {
     .filter(Boolean) as PrivateNote[];
 }
 
-/**
- * Remove a note (after successful withdrawal).
- */
 export function removeNote(commitment: string): void {
   const key = `aion_note_${commitment.slice(2, 10)}`;
   localStorage.removeItem(key);
   const indexRaw = localStorage.getItem("aion_note_index") ?? "[]";
   const index: string[] = JSON.parse(indexRaw);
-  localStorage.setItem(
-    "aion_note_index",
-    JSON.stringify(index.filter((k) => k !== key))
-  );
+  localStorage.setItem("aion_note_index", JSON.stringify(index.filter((k) => k !== key)));
 }
 
-// ─── Merkle Tree (Poseidon sorted-pair, matches PrivacyLayer.verify_poseidon) ──
+// ── Merkle tree (sorted-pair Poseidon) ──────────────────────────────────────
 
 function sortedPairHash(a: string, b: string): string {
-  const aNum = BigInt(a);
-  const bNum = BigInt(b);
-  // Must match Cairo's poseidon_hash_span([min, max]) — use OnElements, not Hash
-  return aNum < bNum
+  return BigInt(a) < BigInt(b)
     ? hash.computePoseidonHashOnElements([a, b])
     : hash.computePoseidonHashOnElements([b, a]);
 }
 
-/**
- * Build a Poseidon Merkle tree from an array of leaves.
- * Returns each layer from leaves (index 0) up to root (last index).
- * Odd leaves carry up to the next layer unchanged.
- */
 export function buildMerkleTree(leaves: string[]): string[][] {
   if (leaves.length === 0) return [];
   const layers: string[][] = [leaves];
@@ -145,11 +127,7 @@ export function buildMerkleTree(leaves: string[]): string[][] {
   while (current.length > 1) {
     const next: string[] = [];
     for (let i = 0; i < current.length; i += 2) {
-      if (i + 1 < current.length) {
-        next.push(sortedPairHash(current[i], current[i + 1]));
-      } else {
-        next.push(current[i]); // odd leaf carries up
-      }
+      next.push(i + 1 < current.length ? sortedPairHash(current[i], current[i + 1]) : current[i]);
     }
     layers.push(next);
     current = next;
@@ -157,33 +135,22 @@ export function buildMerkleTree(leaves: string[]): string[][] {
   return layers;
 }
 
-/**
- * Compute Merkle root from leaf array.
- */
 export function computeMerkleRoot(leaves: string[]): string {
   if (leaves.length === 0) return "0x0";
   const layers = buildMerkleTree(leaves);
   return layers[layers.length - 1][0];
 }
 
-/**
- * Build a Merkle proof (list of siblings) for a given commitment.
- * For a single commitment the proof is [] — root equals the leaf.
- */
 export function buildMerkleProof(commitment: string, allCommitments: string[]): string[] {
   if (allCommitments.length <= 1) return [];
   const layers = buildMerkleTree(allCommitments);
   const proof: string[] = [];
   let idx = allCommitments.indexOf(commitment);
   if (idx === -1) return [];
-
   for (let level = 0; level < layers.length - 1; level++) {
     const layer = layers[level];
     const siblingIdx = idx % 2 === 0 ? idx + 1 : idx - 1;
-    if (siblingIdx < layer.length) {
-      proof.push(layer[siblingIdx]);
-    }
-    // If no sibling (odd leaf), it carries up — nothing to add to proof
+    if (siblingIdx < layer.length) proof.push(layer[siblingIdx]);
     idx = Math.floor(idx / 2);
   }
   return proof;

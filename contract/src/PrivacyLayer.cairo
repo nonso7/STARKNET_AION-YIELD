@@ -1,64 +1,98 @@
-/// AION Yield — PrivacyLayer
-/// Commitment-scheme based privacy using Poseidon hashes + Merkle proofs.
-/// Inspired by Stark Cloak mixer but adapted for yield vault use.
-/// Users commit (secret, nullifier) off-chain; on-chain only the hash is stored.
+/// AION Yield — PrivacyLayer (ZK Edition)
+///
+/// Upgraded from a simple Poseidon Merkle proof checker to a full
+/// ZK-proof verifier using the Garaga UltraKeccakHonk backend.
+///
+/// Privacy model
+/// ─────────────
+/// DEPOSIT:
+///   1. User generates (secret, nullifier) off-chain.
+///   2. Computes: commitment = Poseidon2(secret, nullifier, denomination_tier)
+///   3. Calls AionVault.deposit_private(commitment, denomination_tier).
+///      → Calldata reveals: commitment hash + tier (0/1/2/3), NOT the amount.
+///
+/// WITHDRAWAL:
+///   1. User generates a Noir ZK proof off-chain (circuit/src/main.nr).
+///      Public inputs: root, nullifier_hash, recipient, denomination_tier
+///   2. Calls AionVault.withdraw_private(zk_proof, nullifier_hash, recipient, tier).
+///      → Calldata reveals: proof bytes + nullifier hash (opaque) + recipient.
+///      → secret and nullifier are NEVER in calldata.
+///
+/// Double-spend prevention
+/// ───────────────────────
+/// nullifier_hash = Poseidon2(nullifier) is marked spent after first withdrawal.
+/// Re-using the same note produces the same nullifier_hash → rejected.
+///
+/// ZK Verifier
+/// ───────────
+/// Uses Garaga's deployed UltraKeccakHonk verifier contract on Starknet.
+/// Address is set by the owner after deployment (configurable per network).
+/// https://github.com/keep-starknet-strange/garaga
 
 use starknet::ContractAddress;
 use core::poseidon::poseidon_hash_span;
 
-/// Verify a Poseidon Merkle proof. Sorted-pair hashing matches OZ standard.
-fn verify_poseidon(root: felt252, leaf: felt252, proof: Span<felt252>) -> bool {
-    let mut current = leaf;
-    let mut i: u32 = 0;
-    loop {
-        if i >= proof.len() { break; }
-        let sibling = *proof[i];
-        let current_u256: u256 = current.into();
-        let sibling_u256: u256 = sibling.into();
-        current = if current_u256 < sibling_u256 {
-            poseidon_hash_span(array![current, sibling].span())
-        } else {
-            poseidon_hash_span(array![sibling, current].span())
-        };
-        i += 1;
-    };
-    current == root
+/// Denomination tier → WBTC satoshi amount
+/// Tier 0: 0.001 WBTC = 100_000
+/// Tier 1: 0.01  WBTC = 1_000_000
+/// Tier 2: 0.1   WBTC = 10_000_000
+/// Tier 3: 1.0   WBTC = 100_000_000
+fn denomination_amount(tier: u8) -> u256 {
+    if tier == 0 { 100_000_u256 }
+    else if tier == 1 { 1_000_000_u256 }
+    else if tier == 2 { 10_000_000_u256 }
+    else if tier == 3 { 100_000_000_u256 }
+    else { panic!("Invalid denomination tier") }
 }
 
 #[starknet::interface]
 pub trait IPrivacyLayer<TContractState> {
     fn register_commitment(ref self: TContractState, commitment: felt252);
-    fn verify_and_nullify(
+    fn verify_zk_and_nullify(
         ref self: TContractState,
-        merkle_proof: Span<felt252>,
-        secret: felt252,
-        nullifier: felt252,
-        amount: u256
+        zk_proof: Span<felt252>,
+        nullifier_hash: felt252,
+        recipient: ContractAddress,
+        denomination_tier: u8,
     ) -> bool;
     fn update_root(ref self: TContractState, new_root: felt252);
+    fn set_garaga_verifier(ref self: TContractState, verifier: ContractAddress);
+    fn set_vault(ref self: TContractState, vault: ContractAddress);
     fn get_merkle_root(self: @TContractState) -> felt252;
     fn get_commitment_at(self: @TContractState, index: u32) -> felt252;
     fn is_nullifier_spent(self: @TContractState, nullifier_hash: felt252) -> bool;
     fn get_total_commitments(self: @TContractState) -> u32;
-    fn set_vault(ref self: TContractState, vault: ContractAddress);
+    fn get_garaga_verifier(self: @TContractState) -> ContractAddress;
+    fn get_denomination_amount(self: @TContractState, tier: u8) -> u256;
+}
+
+/// Garaga UltraKeccakHonk verifier dispatch interface.
+/// We call the deployed Garaga contract via this interface.
+#[starknet::interface]
+trait IGaragaVerifier<TContractState> {
+    fn verify_ultra_keccak_honk_proof(
+        self: @TContractState,
+        full_proof_with_hints: Span<felt252>,
+    ) -> Option<Span<u256>>;
 }
 
 #[starknet::contract]
 pub mod PrivacyLayer {
-    use super::IPrivacyLayer;
+    use super::{IPrivacyLayer, IGaragaVerifierDispatcher, IGaragaVerifierDispatcherTrait};
+    use super::denomination_amount;
     use starknet::{ContractAddress, get_caller_address, get_block_timestamp};
     use starknet::storage::{
         StoragePointerReadAccess, StoragePointerWriteAccess,
         Map, StorageMapReadAccess, StorageMapWriteAccess
     };
-    use core::poseidon::poseidon_hash_span;
-    use super::verify_poseidon;
+    use core::num::traits::Zero;
 
     #[storage]
     struct Storage {
         vault: ContractAddress,
         owner: ContractAddress,
         merkle_root: felt252,
+        garaga_verifier: ContractAddress,
         commitments: Map<u32, felt252>,
         total_commitments: u32,
         nullifiers: Map<felt252, bool>,
@@ -70,6 +104,7 @@ pub mod PrivacyLayer {
         CommitmentRegistered: CommitmentRegistered,
         NullifierSpent: NullifierSpent,
         RootUpdated: RootUpdated,
+        GaragaVerifierSet: GaragaVerifierSet,
     }
 
     #[derive(Drop, starknet::Event)]
@@ -91,6 +126,11 @@ pub mod PrivacyLayer {
         pub new_root: felt252,
     }
 
+    #[derive(Drop, starknet::Event)]
+    pub struct GaragaVerifierSet {
+        pub verifier: ContractAddress,
+    }
+
     #[constructor]
     fn constructor(
         ref self: ContractState,
@@ -107,8 +147,10 @@ pub mod PrivacyLayer {
     #[abi(embed_v0)]
     impl PrivacyLayerImpl of IPrivacyLayer<ContractState> {
 
-        /// Called by AionVault on private deposit.
-        /// Stores commitment hash on-chain — amount is hidden.
+        // ─────────────────────────────────────────────────────────────────
+        // DEPOSIT SIDE — register commitment on-chain
+        // ─────────────────────────────────────────────────────────────────
+
         fn register_commitment(ref self: ContractState, commitment: felt252) {
             let caller = get_caller_address();
             assert(caller == self.vault.read(), 'Only vault can register');
@@ -125,33 +167,78 @@ pub mod PrivacyLayer {
             });
         }
 
-        /// Called by AionVault on private withdrawal.
-        /// Verifies Merkle proof + computes commitment from (secret, nullifier).
-        /// Marks nullifier spent to prevent double-withdrawals.
-        fn verify_and_nullify(
+        // ─────────────────────────────────────────────────────────────────
+        // WITHDRAWAL SIDE — ZK proof verification via Garaga
+        // ─────────────────────────────────────────────────────────────────
+
+        /// Verify a Noir UltraKeccakHonk proof and mark the nullifier spent.
+        ///
+        /// The Garaga verifier extracts the public inputs from the proof:
+        ///   [0] root              — must match self.merkle_root
+        ///   [1] nullifier_hash    — must match the argument
+        ///   [2] recipient         — must match the argument (as felt252)
+        ///   [3] denomination_tier — must match the argument
+        ///
+        /// Panics if:
+        ///   - Caller is not the vault
+        ///   - Garaga verifier is not configured
+        ///   - ZK proof is invalid
+        ///   - Public inputs mismatch stored state
+        ///   - Nullifier has already been spent
+        fn verify_zk_and_nullify(
             ref self: ContractState,
-            merkle_proof: Span<felt252>,
-            secret: felt252,
-            nullifier: felt252,
-            amount: u256
+            zk_proof: Span<felt252>,
+            nullifier_hash: felt252,
+            recipient: ContractAddress,
+            denomination_tier: u8,
         ) -> bool {
             let caller = get_caller_address();
             assert(caller == self.vault.read(), 'Only vault can nullify');
 
-            // Derive commitment = poseidon(secret, nullifier)
-            let commitment = poseidon_hash_span(array![secret, nullifier].span());
-
-            // Derive nullifier hash to prevent double-spend
-            let nullifier_hash = poseidon_hash_span(array![nullifier].span());
+            // Double-spend check before calling verifier (cheap early exit)
             assert(!self.nullifiers.read(nullifier_hash), 'Nullifier already spent');
 
-            // Verify commitment exists in Merkle tree
-            let root = self.merkle_root.read();
-            let leaf = commitment;
-            let is_valid = verify_poseidon(root, leaf, merkle_proof);
-            assert(is_valid, 'Invalid Merkle proof');
+            let verifier_addr = self.garaga_verifier.read();
+            assert(verifier_addr.is_non_zero(), 'Garaga verifier not set');
 
-            // Mark nullifier spent
+            // ── Call Garaga on-chain verifier ───────────────────────────────
+            let verifier = IGaragaVerifierDispatcher { contract_address: verifier_addr };
+            let result = verifier.verify_ultra_keccak_honk_proof(zk_proof);
+
+            // ── Extract and validate public inputs ──────────────────────────
+            match result {
+                Option::Some(public_inputs) => {
+                    assert(public_inputs.len() >= 4, 'Bad public inputs length');
+
+                    // [0] root — must match the stored Merkle root
+                    let proof_root: felt252 = (*public_inputs.at(0))
+                        .try_into()
+                        .expect('Root: u256 overflow');
+                    assert(proof_root == self.merkle_root.read(), 'Proof root mismatch');
+
+                    // [1] nullifier_hash — must match the submitted nullifier_hash
+                    let proof_nh: felt252 = (*public_inputs.at(1))
+                        .try_into()
+                        .expect('NH: u256 overflow');
+                    assert(proof_nh == nullifier_hash, 'Nullifier hash mismatch');
+
+                    // [2] recipient — must match the submitted recipient address
+                    let proof_recipient: felt252 = (*public_inputs.at(2))
+                        .try_into()
+                        .expect('Recipient: u256 overflow');
+                    let expected_recipient: felt252 = recipient.into();
+                    assert(proof_recipient == expected_recipient, 'Recipient mismatch');
+
+                    // [3] denomination_tier — must match the submitted tier
+                    let proof_tier: u256 = *public_inputs.at(3);
+                    assert(proof_tier == denomination_tier.into(), 'Denomination tier mismatch');
+                },
+                Option::None => {
+                    assert(false, 'ZK proof invalid')
+                },
+            }
+
+            // ── Mark nullifier as spent ─────────────────────────────────────
             self.nullifiers.write(nullifier_hash, true);
 
             self.emit(NullifierSpent {
@@ -162,7 +249,10 @@ pub mod PrivacyLayer {
             true
         }
 
-        /// Owner updates Merkle root after new commitments are added off-chain.
+        // ─────────────────────────────────────────────────────────────────
+        // ADMIN
+        // ─────────────────────────────────────────────────────────────────
+
         fn update_root(ref self: ContractState, new_root: felt252) {
             let caller = get_caller_address();
             assert(
@@ -173,6 +263,21 @@ pub mod PrivacyLayer {
             self.merkle_root.write(new_root);
             self.emit(RootUpdated { old_root, new_root });
         }
+
+        fn set_garaga_verifier(ref self: ContractState, verifier: ContractAddress) {
+            assert(get_caller_address() == self.owner.read(), 'Only owner');
+            self.garaga_verifier.write(verifier);
+            self.emit(GaragaVerifierSet { verifier });
+        }
+
+        fn set_vault(ref self: ContractState, vault: ContractAddress) {
+            assert(get_caller_address() == self.owner.read(), 'Only owner');
+            self.vault.write(vault);
+        }
+
+        // ─────────────────────────────────────────────────────────────────
+        // VIEW
+        // ─────────────────────────────────────────────────────────────────
 
         fn get_merkle_root(self: @ContractState) -> felt252 {
             self.merkle_root.read()
@@ -190,9 +295,12 @@ pub mod PrivacyLayer {
             self.total_commitments.read()
         }
 
-        fn set_vault(ref self: ContractState, vault: ContractAddress) {
-            assert(get_caller_address() == self.owner.read(), 'Only owner');
-            self.vault.write(vault);
+        fn get_garaga_verifier(self: @ContractState) -> ContractAddress {
+            self.garaga_verifier.read()
+        }
+
+        fn get_denomination_amount(self: @ContractState, tier: u8) -> u256 {
+            denomination_amount(tier)
         }
     }
 }
